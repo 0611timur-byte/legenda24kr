@@ -21,6 +21,7 @@ const MAIN_KEYBOARD = {
 function newDatabase() {
   return {
     users: {},
+    admins: {},
     products: [
       {
         id: "hairdryer-single",
@@ -48,6 +49,10 @@ function userName(user) {
   return [user.first_name, user.last_name].filter(Boolean).join(" ") ||
     user.username ||
     `ID ${user.id}`;
+}
+
+function normalizeUsername(value) {
+  return String(value || "").trim().replace(/^@/, "").toLowerCase();
 }
 
 function money(amount) {
@@ -188,13 +193,16 @@ export class BotState {
 
   async readDb() {
     await this.dbReady;
-    return (await this.state.storage.get("database")) || newDatabase();
+    const db = (await this.state.storage.get("database")) || newDatabase();
+    db.admins ||= {};
+    return db;
   }
 
   async mutateDb(mutator) {
     await this.dbReady;
     return this.state.storage.transaction(async (txn) => {
       const db = (await txn.get("database")) || newDatabase();
+      db.admins ||= {};
       const result = await mutator(db);
       await txn.put("database", db);
       return result;
@@ -235,6 +243,45 @@ export class BotState {
       db.users[id].username = user.username || null;
       return { ...db.users[id] };
     });
+  }
+
+  isOwner(userId) {
+    return String(userId) === String(this.env.ADMIN_ID);
+  }
+
+  async isAdmin(userId) {
+    if (this.isOwner(userId)) return true;
+    const db = await this.readDb();
+    return Boolean(db.admins[String(userId)]);
+  }
+
+  async adminRecipients() {
+    const db = await this.readDb();
+    return [...new Set([String(this.env.ADMIN_ID), ...Object.keys(db.admins)])];
+  }
+
+  async sendReceiptToAdmins(image, caption, replyMarkup) {
+    const recipients = await this.adminRecipients();
+    let delivered = 0;
+    let lastError;
+    for (const chatId of recipients) {
+      try {
+        await this.telegram(
+          image.type === "photo" ? "sendPhoto" : "sendDocument",
+          {
+            chat_id: chatId,
+            [image.type === "photo" ? "photo" : "document"]: image.fileId,
+            caption,
+            reply_markup: replyMarkup,
+          },
+        );
+        delivered++;
+      } catch (error) {
+        lastError = error;
+        console.error(`Receipt notification failed for admin ${chatId}:`, error?.message || error);
+      }
+    }
+    if (!delivered) throw lastError || new Error("No admin could receive the receipt.");
   }
 
   async cardForUser() {
@@ -313,7 +360,7 @@ export class BotState {
     if (!chat || !from || chat.type !== "private") return;
     await this.ensureUser(from);
 
-    const isAdmin = String(from.id) === String(this.env.ADMIN_ID);
+    const isAdmin = await this.isAdmin(from.id);
     const text = String(message.text || "").trim();
 
     if (text === "/cancel") {
@@ -346,7 +393,7 @@ export class BotState {
     }
 
     if (isAdmin && (text === "/admin" || text === "⚙️ Админ-панель")) {
-      await this.showAdminMenu(chat.id);
+      await this.showAdminMenu(chat.id, from.id);
       return;
     }
 
@@ -413,7 +460,7 @@ export class BotState {
     }
 
     if (isAdmin && text === "/admin") {
-      await this.showAdminMenu(chat.id);
+      await this.showAdminMenu(chat.id, from.id);
       return;
     }
     await this.sendMessage(
@@ -476,15 +523,7 @@ export class BotState {
     };
 
     try {
-      await this.telegram(
-        image.type === "photo" ? "sendPhoto" : "sendDocument",
-        {
-          chat_id: this.env.ADMIN_ID,
-          [image.type === "photo" ? "photo" : "document"]: image.fileId,
-          caption,
-          reply_markup: replyMarkup,
-        },
-      );
+      await this.sendReceiptToAdmins(image, caption, replyMarkup);
     } catch (error) {
       await this.mutateDb((current) => {
         const record = current.pending[submitting.id];
@@ -547,17 +586,41 @@ export class BotState {
     await this.sendMessage(chatId, text, { reply_markup: keyboard });
   }
 
-  async showAdminMenu(chatId) {
+  async showAdminMenu(chatId, userId) {
+    const keyboard = [
+      [{ text: "Изменить карту оплаты", callback_data: "adm:card" }],
+      [{ text: "Товары и описания", callback_data: "adm:products" }],
+      [{ text: "Изменить поддержку/контакты", callback_data: "adm:support" }],
+      [{ text: "Заявки на проверке", callback_data: "adm:pending" }],
+    ];
+    if (this.isOwner(userId)) {
+      keyboard.push([{ text: "Управление администраторами", callback_data: "owner:admins" }]);
+    }
     await this.sendMessage(chatId, "Панель администратора PseudoLegend", {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "Изменить карту оплаты", callback_data: "adm:card" }],
-          [{ text: "Товары и описания", callback_data: "adm:products" }],
-          [{ text: "Изменить поддержку/контакты", callback_data: "adm:support" }],
-          [{ text: "Заявки на проверке", callback_data: "adm:pending" }],
-        ],
-      },
+      reply_markup: { inline_keyboard: keyboard },
     });
+  }
+
+  async showAdminList(chatId) {
+    const db = await this.readDb();
+    const entries = Object.values(db.admins);
+    const adminLines = entries.length
+      ? entries.map((admin) =>
+        `• ${admin.name || `ID ${admin.id}`}${admin.username ? ` (@${admin.username})` : ""} — ID ${admin.id}`,
+      )
+      : ["Дополнительных администраторов пока нет."];
+    const rows = [[{ text: "＋ Добавить по @нику", callback_data: "owner:add" }]];
+    for (const admin of entries) {
+      const label = admin.username
+        ? `Удалить @${admin.username}`
+        : `Удалить ID ${admin.id}`;
+      rows.push([{ text: label.slice(0, 60), callback_data: `owner:remove:${admin.id}` }]);
+    }
+    await this.sendMessage(
+      chatId,
+      `Главный администратор: ID ${this.env.ADMIN_ID}\n\nДополнительные администраторы:\n${adminLines.join("\n")}`,
+      { reply_markup: { inline_keyboard: rows } },
+    );
   }
 
   async showAdminProducts(chatId) {
@@ -578,6 +641,57 @@ export class BotState {
     const db = await this.readDb();
     const flow = db.users[String(message.from.id)]?.flow;
     if (!flow?.type?.startsWith("admin_")) return false;
+
+    if (flow.type === "admin_add_admin") {
+      if (!this.isOwner(message.from.id)) {
+        await this.sendMessage(message.chat.id, "Добавлять администраторов может только главный администратор.");
+        return true;
+      }
+      const username = normalizeUsername(text);
+      if (!/^[a-z0-9_]{5,32}$/i.test(username)) {
+        await this.sendMessage(message.chat.id, "Введите корректный Telegram-ник, например @username.");
+        return true;
+      }
+      const invitedUser = Object.values(db.users).find(
+        (user) => normalizeUsername(user.username) === username,
+      );
+      if (!invitedUser) {
+        await this.sendMessage(
+          message.chat.id,
+          `Пользователь @${username} ещё не запускал бота. Попросите его отправить /start, затем добавьте ник повторно.`,
+        );
+        return true;
+      }
+      if (this.isOwner(invitedUser.id)) {
+        await this.sendMessage(message.chat.id, "Это главный администратор.");
+        return true;
+      }
+      const added = await this.mutateDb((current) => {
+        if (current.admins[invitedUser.id]) return false;
+        current.admins[invitedUser.id] = {
+          id: invitedUser.id,
+          name: invitedUser.name,
+          username: invitedUser.username,
+          addedBy: String(message.from.id),
+          addedAt: new Date().toISOString(),
+        };
+        current.users[String(message.from.id)].flow = null;
+        return true;
+      });
+      if (!added) {
+        await this.sendMessage(message.chat.id, `@${username} уже является администратором.`);
+        return true;
+      }
+      await this.sendMessage(
+        message.chat.id,
+        `@${username} добавлен как администратор. Он сможет принимать заявки и редактировать каталог.`,
+      );
+      await this.sendMessage(
+        invitedUser.id,
+        "Вам предоставлен доступ администратора PseudoLegend. Используйте /admin для панели.",
+      );
+      return true;
+    }
 
     if (flow.type === "admin_card") {
       const card = text.replace(/[ -]/g, "");
@@ -732,18 +846,59 @@ export class BotState {
     const data = String(query.data || "");
     try {
       if (chatId == null) return;
-      if (data.startsWith("adm:") || data.startsWith("pay:")) {
-        if (String(from.id) !== String(this.env.ADMIN_ID)) {
-          await this.telegram("answerCallbackQuery", {
-            callback_query_id: query.id,
-            text: "Нет доступа.",
-            show_alert: true,
-          });
-          return;
-        }
+      const isOwnerOnly =
+        data.startsWith("owner:") ||
+        data === "adm:card" ||
+        data === "adm:support";
+      const allowed = isOwnerOnly
+        ? this.isOwner(from.id)
+        : data.startsWith("adm:") || data.startsWith("pay:")
+          ? await this.isAdmin(from.id)
+          : true;
+      if (!allowed) {
+        await this.telegram("answerCallbackQuery", {
+          callback_query_id: query.id,
+          text: "Нет доступа.",
+          show_alert: true,
+        });
+        return;
       }
       await this.telegram("answerCallbackQuery", { callback_query_id: query.id });
 
+      if (data === "owner:admins") {
+        await this.showAdminList(chatId);
+        return;
+      }
+      if (data === "owner:add") {
+        await this.mutateDb((db) => {
+          db.users[String(from.id)] ||= {
+            id: String(from.id),
+            name: userName(from),
+            username: from.username || null,
+            balance: 0,
+            flow: null,
+          };
+          db.users[String(from.id)].flow = { type: "admin_add_admin" };
+        });
+        await this.sendMessage(
+          chatId,
+          "Введите @ник пользователя. Сначала он должен открыть бота и отправить /start.",
+        );
+        return;
+      }
+      if (data.startsWith("owner:remove:")) {
+        const adminId = data.slice("owner:remove:".length);
+        const removed = await this.mutateDb((db) => {
+          if (!db.admins[adminId]) return false;
+          delete db.admins[adminId];
+          return true;
+        });
+        await this.sendMessage(
+          chatId,
+          removed ? `Администратор ID ${adminId} удалён.` : "Администратор не найден.",
+        );
+        return;
+      }
       if (data === "adm:card") {
         await this.mutateDb((db) => {
           db.users[String(from.id)] ||= { id: String(from.id), name: userName(from), balance: 0, flow: null };
