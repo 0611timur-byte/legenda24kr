@@ -9,6 +9,11 @@
 const CITY = "Кривой Рог";
 const DISTRICT = "Дружба";
 const TELEGRAM_API = "https://api.telegram.org";
+const STICKER_SLOTS = {
+  welcome: "приветствие",
+  order: "подтверждение заказа",
+  payment: "подтверждение пополнения",
+};
 
 const MAIN_KEYBOARD = {
   keyboard: [
@@ -22,6 +27,7 @@ function newDatabase() {
   return {
     users: {},
     admins: {},
+    stickers: {},
     products: [
       {
         id: "hairdryer-single",
@@ -72,6 +78,16 @@ function imageFromMessage(message) {
     String(message.document.mime_type || "").startsWith("image/")
   ) {
     return { type: "document", fileId: message.document.file_id };
+  }
+  return null;
+}
+
+function stickerMediaFromMessage(message) {
+  if (message.sticker?.file_id) {
+    return { mediaType: "sticker", fileId: message.sticker.file_id };
+  }
+  if (message.animation?.file_id) {
+    return { mediaType: "animation", fileId: message.animation.file_id };
   }
   return null;
 }
@@ -195,6 +211,7 @@ export class BotState {
     await this.dbReady;
     const db = (await this.state.storage.get("database")) || newDatabase();
     db.admins ||= {};
+    db.stickers ||= {};
     db.changeRequests ||= {};
     return db;
   }
@@ -204,6 +221,7 @@ export class BotState {
     return this.state.storage.transaction(async (txn) => {
       const db = (await txn.get("database")) || newDatabase();
       db.admins ||= {};
+      db.stickers ||= {};
       db.changeRequests ||= {};
       const result = await mutator(db);
       await txn.put("database", db);
@@ -235,6 +253,26 @@ export class BotState {
       text: safeText(text, 4000),
       ...extra,
     });
+  }
+
+  async sendStickerMedia(chatId, media) {
+    if (!media?.fileId) return false;
+    const isAnimation = media.mediaType === "animation";
+    try {
+      await this.telegram(isAnimation ? "sendAnimation" : "sendSticker", {
+        chat_id: chatId,
+        [isAnimation ? "animation" : "sticker"]: media.fileId,
+      });
+      return true;
+    } catch (error) {
+      console.error("Sticker/animation delivery failed:", error?.message || error);
+      return false;
+    }
+  }
+
+  async sendConfiguredSticker(chatId, slot) {
+    const db = await this.readDb();
+    return this.sendStickerMedia(chatId, db.stickers?.[slot]);
   }
 
   async ensureUser(user) {
@@ -386,6 +424,7 @@ export class BotState {
       await this.mutateDb((db) => {
         if (db.users[String(from.id)]) db.users[String(from.id)].flow = null;
       });
+      await this.sendConfiguredSticker(chat.id, "welcome");
       await this.sendMessage(
         chat.id,
         `Добро пожаловать в PseudoLegend.\nГород: ${CITY}\nРайон: ${DISTRICT}`,
@@ -593,6 +632,7 @@ export class BotState {
       [{ text: "Изменить карту оплаты", callback_data: "adm:card" }],
       [{ text: "Товары и описания", callback_data: "adm:products" }],
       [{ text: "Изменить поддержку/контакты", callback_data: "adm:support" }],
+      [{ text: "Стикеры и анимация", callback_data: "adm:visuals" }],
       [{ text: "Заявки на проверке", callback_data: "adm:pending" }],
     ];
     if (this.isOwner(userId)) {
@@ -602,6 +642,32 @@ export class BotState {
     await this.sendMessage(chatId, "Панель администратора PseudoLegend", {
       reply_markup: { inline_keyboard: keyboard },
     });
+  }
+
+  async showStickerMenu(chatId) {
+    const db = await this.readDb();
+    const labels = {
+      welcome: "Приветствие",
+      order: "Подтверждение заказа",
+      payment: "Подтверждение пополнения",
+    };
+    const rows = Object.entries(labels).map(([slot, label]) => {
+      const media = db.stickers?.[slot];
+      const kind = media
+        ? media.mediaType === "animation"
+          ? "GIF"
+          : "стикер"
+        : "не задан";
+      return [{
+        text: `${label}: ${kind}`,
+        callback_data: `adm:sticker:${slot}`,
+      }];
+    });
+    await this.sendMessage(
+      chatId,
+      "Отправьте статический или анимированный стикер для нужного события. Можно также отправить GIF-анимацию. Изменения дополнительных администраторов сначала подтверждает главный администратор.",
+      { reply_markup: { inline_keyboard: rows } },
+    );
   }
 
   async showAdminList(chatId) {
@@ -635,6 +701,19 @@ export class BotState {
       db.supportText = change.text;
       return true;
     }
+    if (change.type === "set_sticker") {
+      if (
+        !STICKER_SLOTS[change.slot] ||
+        !["sticker", "animation"].includes(change.mediaType) ||
+        !change.fileId
+      ) return false;
+      db.stickers ||= {};
+      db.stickers[change.slot] = {
+        mediaType: change.mediaType,
+        fileId: change.fileId,
+      };
+      return true;
+    }
     if (change.type === "product_create") {
       if (db.products.some((product) => product.id === change.product.id)) return false;
       db.products.push(change.product);
@@ -655,6 +734,12 @@ export class BotState {
     }
     if (change.type === "set_support") {
       return `Изменение контактов поддержки\nНовый текст:\n${change.text}`;
+    }
+    if (change.type === "set_sticker") {
+      const format = change.mediaType === "animation"
+        ? "GIF-анимация"
+        : "стикер (может быть анимированным)";
+      return `Изменение визуала: ${STICKER_SLOTS[change.slot] || "неизвестное событие"}\nФормат: ${format}.`;
     }
     if (change.type === "product_create") {
       const product = change.product;
@@ -727,6 +812,11 @@ export class BotState {
         { text: "Отклонить", callback_data: `change:decline:${request.id}` },
       ]],
     };
+    if (request.change.type === "set_sticker") {
+      await this.sendStickerMedia(this.env.ADMIN_ID, request.change);
+      await this.sendMessage(this.env.ADMIN_ID, text, { reply_markup: replyMarkup });
+      return;
+    }
     if (photo) {
       await this.telegram("sendPhoto", {
         chat_id: this.env.ADMIN_ID,
@@ -774,6 +864,11 @@ export class BotState {
       : request.change.type === "product_update"
         ? request.change.patch.photo
         : null;
+    if (request.change.type === "set_sticker") {
+      await this.sendStickerMedia(chatId, request.change);
+      await this.sendMessage(chatId, text, { reply_markup: replyMarkup });
+      return;
+    }
     if (photo) {
       await this.telegram("sendPhoto", {
         chat_id: chatId,
