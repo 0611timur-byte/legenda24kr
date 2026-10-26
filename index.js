@@ -195,6 +195,7 @@ export class BotState {
     await this.dbReady;
     const db = (await this.state.storage.get("database")) || newDatabase();
     db.admins ||= {};
+    db.changeRequests ||= {};
     return db;
   }
 
@@ -203,6 +204,7 @@ export class BotState {
     return this.state.storage.transaction(async (txn) => {
       const db = (await txn.get("database")) || newDatabase();
       db.admins ||= {};
+      db.changeRequests ||= {};
       const result = await mutator(db);
       await txn.put("database", db);
       return result;
@@ -595,6 +597,7 @@ export class BotState {
     ];
     if (this.isOwner(userId)) {
       keyboard.push([{ text: "Управление администраторами", callback_data: "owner:admins" }]);
+      keyboard.push([{ text: "Изменения на подтверждение", callback_data: "change:list" }]);
     }
     await this.sendMessage(chatId, "Панель администратора PseudoLegend", {
       reply_markup: { inline_keyboard: keyboard },
@@ -620,6 +623,216 @@ export class BotState {
       chatId,
       `Главный администратор: ID ${this.env.ADMIN_ID}\n\nДополнительные администраторы:\n${adminLines.join("\n")}`,
       { reply_markup: { inline_keyboard: rows } },
+    );
+  }
+
+  applyChange(db, change) {
+    if (change.type === "set_card") {
+      db.encryptedCard = change.encryptedCard;
+      return true;
+    }
+    if (change.type === "set_support") {
+      db.supportText = change.text;
+      return true;
+    }
+    if (change.type === "product_create") {
+      if (db.products.some((product) => product.id === change.product.id)) return false;
+      db.products.push(change.product);
+      return true;
+    }
+    if (change.type === "product_update") {
+      const product = db.products.find((item) => item.id === change.productId);
+      if (!product) return false;
+      Object.assign(product, change.patch);
+      return true;
+    }
+    return false;
+  }
+
+  describeChange(db, change) {
+    if (change.type === "set_card") {
+      return `Изменение карты оплаты\nНовая карта заканчивается на ${change.lastFour}.`;
+    }
+    if (change.type === "set_support") {
+      return `Изменение контактов поддержки\nНовый текст:\n${change.text}`;
+    }
+    if (change.type === "product_create") {
+      const product = change.product;
+      return [
+        "Добавление товара",
+        `Название: ${product.name}`,
+        `Цена: ${money(product.price)}`,
+        `Описание: ${product.description || "—"}`,
+        `Фото: ${product.photo ? "прикреплено" : "нет"}`,
+      ].join("\n");
+    }
+    if (change.type === "product_update") {
+      const product = db.products.find((item) => item.id === change.productId);
+      const patch = change.patch;
+      return [
+        `Изменение товара: ${product?.name || change.productId}`,
+        patch.name !== undefined ? `Новое название: ${patch.name}` : "",
+        patch.price !== undefined ? `Новая цена: ${money(patch.price)}` : "",
+        patch.description !== undefined ? `Новое описание: ${patch.description}` : "",
+        patch.photo !== undefined ? "Запрошена новая фотография товара." : "",
+      ].filter(Boolean).join("\n");
+    }
+    return "Изменение настроек бота.";
+  }
+
+  async submitChangeRequest(requester, change) {
+    if (this.isOwner(requester.id)) {
+      const applied = await this.mutateDb((db) => this.applyChange(db, change));
+      return { status: applied ? "applied" : "error" };
+    }
+
+    const id = crypto.randomUUID().slice(0, 12);
+    const request = await this.mutateDb((db) => {
+      const user = db.users[String(requester.id)];
+      const item = {
+        id,
+        requesterId: String(requester.id),
+        requesterName: user?.name || userName(requester),
+        requesterUsername: user?.username || requester.username || null,
+        change,
+        status: "pending",
+        createdAt: new Date().toISOString(),
+      };
+      db.changeRequests[id] = item;
+      return item;
+    });
+
+    try {
+      await this.notifyChangeRequest(request, await this.readDb());
+    } catch (error) {
+      console.error("Change request notification failed:", error?.message || error);
+    }
+    return { status: "pending", id };
+  }
+
+  async notifyChangeRequest(request, db) {
+    const detail = this.describeChange(db, request.change);
+    const text = safeText(
+      `ЗАПРОС ИЗМЕНЕНИЯ ${request.id}\nОт: ${request.requesterName}${request.requesterUsername ? ` (@${request.requesterUsername})` : ""}\n\n${detail}`,
+      1000,
+    );
+    const photo = request.change.type === "product_create"
+      ? request.change.product.photo
+      : request.change.type === "product_update"
+        ? request.change.patch.photo
+        : null;
+    const replyMarkup = {
+      inline_keyboard: [[
+        { text: "Подтвердить", callback_data: `change:approve:${request.id}` },
+        { text: "Отклонить", callback_data: `change:decline:${request.id}` },
+      ]],
+    };
+    if (photo) {
+      await this.telegram("sendPhoto", {
+        chat_id: this.env.ADMIN_ID,
+        photo,
+        caption: text,
+        reply_markup: replyMarkup,
+      });
+    } else {
+      await this.sendMessage(this.env.ADMIN_ID, text, { reply_markup: replyMarkup });
+    }
+  }
+
+  async showChangeRequests(chatId) {
+    const db = await this.readDb();
+    const requests = Object.values(db.changeRequests)
+      .filter((item) => item.status === "pending")
+      .slice(0, 30);
+    if (!requests.length) {
+      await this.sendMessage(chatId, "Нет изменений, ожидающих подтверждения.");
+      return;
+    }
+    const rows = requests.map((item) => [{
+      text: `${item.id} — ${item.requesterUsername ? `@${item.requesterUsername}` : item.requesterName}`,
+      callback_data: `change:view:${item.id}`,
+    }]);
+    await this.sendMessage(chatId, "Изменения на подтверждение:", {
+      reply_markup: { inline_keyboard: rows },
+    });
+  }
+
+  async showChangeRequest(chatId, request) {
+    const db = await this.readDb();
+    const text = safeText(
+      `ЗАПРОС ИЗМЕНЕНИЯ ${request.id}\nОт: ${request.requesterName}${request.requesterUsername ? ` (@${request.requesterUsername})` : ""}\n\n${this.describeChange(db, request.change)}`,
+      1000,
+    );
+    const replyMarkup = {
+      inline_keyboard: [[
+        { text: "Подтвердить", callback_data: `change:approve:${request.id}` },
+        { text: "Отклонить", callback_data: `change:decline:${request.id}` },
+      ]],
+    };
+    const photo = request.change.type === "product_create"
+      ? request.change.product.photo
+      : request.change.type === "product_update"
+        ? request.change.patch.photo
+        : null;
+    if (photo) {
+      await this.telegram("sendPhoto", {
+        chat_id: chatId,
+        photo,
+        caption: text,
+        reply_markup: replyMarkup,
+      });
+    } else {
+      await this.sendMessage(chatId, text, { reply_markup: replyMarkup });
+    }
+  }
+
+  async handleChangeAction(chatId, adminId, data) {
+    const [, action, requestId] = data.split(":");
+    const db = await this.readDb();
+    const request = db.changeRequests[requestId];
+    if (!request) {
+      await this.sendMessage(chatId, "Запрос изменения не найден.");
+      return;
+    }
+    if (action === "view") {
+      await this.showChangeRequest(chatId, request);
+      return;
+    }
+    if (action !== "approve" && action !== "decline") return;
+
+    const result = await this.mutateDb((current) => {
+      const item = current.changeRequests[requestId];
+      if (!item || item.status !== "pending") return { ok: false };
+      if (action === "approve" && !this.applyChange(current, item.change)) {
+        return { ok: false, invalid: true };
+      }
+      item.status = action === "approve" ? "approved" : "declined";
+      item.reviewedAt = new Date().toISOString();
+      item.reviewedBy = String(adminId);
+      return { ok: true, item: { ...item } };
+    });
+    if (!result.ok) {
+      await this.sendMessage(
+        chatId,
+        result.invalid
+          ? "Не удалось применить изменение: товар не найден или запрос некорректен."
+          : "Этот запрос уже обработан или не найден.",
+      );
+      return;
+    }
+
+    const item = result.item;
+    const statusText = action === "approve"
+      ? "Главный администратор подтвердил ваше изменение."
+      : "Главный администратор отклонил ваше изменение.";
+    try {
+      await this.sendMessage(item.requesterId, statusText);
+    } catch (error) {
+      console.error("Change decision notification failed:", error?.message || error);
+    }
+    await this.sendMessage(
+      chatId,
+      action === "approve" ? "Изменение применено." : "Запрос отклонён.",
     );
   }
 
@@ -701,10 +914,19 @@ export class BotState {
       }
       const encryptedCard = await encryptCard(card, this.env);
       await this.mutateDb((current) => {
-        current.encryptedCard = encryptedCard;
         current.users[String(message.from.id)].flow = null;
       });
-      await this.sendMessage(message.chat.id, "Номер карты сохранён в зашифрованном виде.");
+      const result = await this.submitChangeRequest(message.from, {
+        type: "set_card",
+        encryptedCard,
+        lastFour: card.slice(-4),
+      });
+      await this.sendMessage(
+        message.chat.id,
+        result.status === "applied"
+          ? "Номер карты сохранён в зашифрованном виде."
+          : "Изменение карты отправлено главному администратору на подтверждение.",
+      );
       return true;
     }
 
@@ -714,10 +936,40 @@ export class BotState {
         return true;
       }
       await this.mutateDb((current) => {
-        current.supportText = text;
         current.users[String(message.from.id)].flow = null;
       });
-      await this.sendMessage(message.chat.id, "Контакты поддержки обновлены.");
+      const result = await this.submitChangeRequest(message.from, {
+        type: "set_support",
+        text,
+      });
+      await this.sendMessage(
+        message.chat.id,
+        result.status === "applied"
+          ? "Контакты поддержки обновлены."
+          : "Изменение контактов отправлено главному администратору на подтверждение.",
+      );
+      return true;
+    }
+
+    if (flow.type === "admin_edit_name") {
+      if (!text || text.length > 80) {
+        await this.sendMessage(message.chat.id, "Введите название товара длиной до 80 символов.");
+        return true;
+      }
+      await this.mutateDb((current) => {
+        current.users[String(message.from.id)].flow = null;
+      });
+      const result = await this.submitChangeRequest(message.from, {
+        type: "product_update",
+        productId: flow.productId,
+        patch: { name: text },
+      });
+      await this.sendMessage(
+        message.chat.id,
+        result.status === "applied"
+          ? "Название товара обновлено."
+          : "Изменение названия отправлено главному администратору на подтверждение.",
+      );
       return true;
     }
 
@@ -728,17 +980,17 @@ export class BotState {
       }
       const id = `p-${crypto.randomUUID().slice(0, 8)}`;
       await this.mutateDb((current) => {
-        current.products.push({
-          id,
-          name: text,
-          price: 0,
-          description: "",
-          photo: null,
-        });
         current.users[String(message.from.id)].flow = {
           type: "admin_price",
           productId: id,
           mode: "new",
+          draft: {
+            id,
+            name: text,
+            price: 0,
+            description: "",
+            photo: null,
+          },
         };
       });
       await this.sendMessage(message.chat.id, "Теперь отправьте цену целым числом в гривнах.");
@@ -751,19 +1003,30 @@ export class BotState {
         await this.sendMessage(message.chat.id, "Введите цену целым числом от 1 до 10 000 000 грн.");
         return true;
       }
-      await this.mutateDb((current) => {
-        const product = current.products.find((item) => item.id === flow.productId);
-        if (product) product.price = price;
-        current.users[String(message.from.id)].flow = {
-          type: flow.mode === "new" ? "admin_description" : null,
-          productId: flow.productId,
-        };
-        if (flow.mode !== "new") current.users[String(message.from.id)].flow = null;
-      });
       if (flow.mode === "new") {
+        await this.mutateDb((current) => {
+          current.users[String(message.from.id)].flow = {
+            type: "admin_description",
+            productId: flow.productId,
+            draft: { ...flow.draft, price },
+          };
+        });
         await this.sendMessage(message.chat.id, "Отправьте описание товара.");
       } else {
-        await this.sendMessage(message.chat.id, "Цена обновлена.");
+        await this.mutateDb((current) => {
+          current.users[String(message.from.id)].flow = null;
+        });
+        const result = await this.submitChangeRequest(message.from, {
+          type: "product_update",
+          productId: flow.productId,
+          patch: { price },
+        });
+        await this.sendMessage(
+          message.chat.id,
+          result.status === "applied"
+            ? "Цена обновлена."
+            : "Изменение цены отправлено главному администратору на подтверждение.",
+        );
       }
       return true;
     }
@@ -773,39 +1036,71 @@ export class BotState {
         await this.sendMessage(message.chat.id, "Введите описание длиной до 2500 символов.");
         return true;
       }
-      await this.mutateDb((current) => {
-        const product = current.products.find((item) => item.id === flow.productId);
-        if (product) product.description = text;
-        current.users[String(message.from.id)].flow = {
-          type: "admin_image",
+      if (flow.draft) {
+        await this.mutateDb((current) => {
+          current.users[String(message.from.id)].flow = {
+            type: "admin_image",
+            productId: flow.productId,
+            draft: { ...flow.draft, description: text },
+          };
+        });
+        await this.sendMessage(
+          message.chat.id,
+          "Отправьте фотографию товара или напишите /skip, чтобы пропустить.",
+        );
+      } else {
+        await this.mutateDb((current) => {
+          current.users[String(message.from.id)].flow = null;
+        });
+        const result = await this.submitChangeRequest(message.from, {
+          type: "product_update",
           productId: flow.productId,
-        };
-      });
-      await this.sendMessage(
-        message.chat.id,
-        "Отправьте фотографию товара или напишите /skip, чтобы пропустить.",
-      );
+          patch: { description: text },
+        });
+        await this.sendMessage(
+          message.chat.id,
+          result.status === "applied"
+            ? "Описание обновлено."
+            : "Изменение описания отправлено главному администратору на подтверждение.",
+        );
+      }
       return true;
     }
 
     if (flow.type === "admin_image") {
       if (text === "/skip") {
+        const result = await this.submitChangeRequest(message.from, {
+          type: "product_create",
+          product: { ...flow.draft, photo: null },
+        });
         await this.mutateDb((current) => {
           current.users[String(message.from.id)].flow = null;
         });
-        await this.sendMessage(message.chat.id, "Товар создан без фотографии.");
+        await this.sendMessage(
+          message.chat.id,
+          result.status === "applied"
+            ? "Товар создан без фотографии."
+            : "Товар отправлен главному администратору на подтверждение.",
+        );
         return true;
       }
       if (!image) {
         await this.sendMessage(message.chat.id, "Отправьте фотографию или /skip.");
         return true;
       }
+      const result = await this.submitChangeRequest(message.from, {
+        type: "product_create",
+        product: { ...flow.draft, photo: image.fileId },
+      });
       await this.mutateDb((current) => {
-        const product = current.products.find((item) => item.id === flow.productId);
-        if (product) product.photo = image.fileId;
         current.users[String(message.from.id)].flow = null;
       });
-      await this.sendMessage(message.chat.id, "Фотография товара сохранена.");
+      await this.sendMessage(
+        message.chat.id,
+        result.status === "applied"
+          ? "Товар создан с фотографией."
+          : "Товар и фотография отправлены главному администратору на подтверждение.",
+      );
       return true;
     }
 
@@ -815,11 +1110,19 @@ export class BotState {
         return true;
       }
       await this.mutateDb((current) => {
-        const product = current.products.find((item) => item.id === flow.productId);
-        if (product) product.description = text;
         current.users[String(message.from.id)].flow = null;
       });
-      await this.sendMessage(message.chat.id, "Описание обновлено.");
+      const result = await this.submitChangeRequest(message.from, {
+        type: "product_update",
+        productId: flow.productId,
+        patch: { description: text },
+      });
+      await this.sendMessage(
+        message.chat.id,
+        result.status === "applied"
+          ? "Описание обновлено."
+          : "Изменение описания отправлено главному администратору на подтверждение.",
+      );
       return true;
     }
 
@@ -829,11 +1132,19 @@ export class BotState {
         return true;
       }
       await this.mutateDb((current) => {
-        const product = current.products.find((item) => item.id === flow.productId);
-        if (product) product.photo = image.fileId;
         current.users[String(message.from.id)].flow = null;
       });
-      await this.sendMessage(message.chat.id, "Фотография товара обновлена.");
+      const result = await this.submitChangeRequest(message.from, {
+        type: "product_update",
+        productId: flow.productId,
+        patch: { photo: image.fileId },
+      });
+      await this.sendMessage(
+        message.chat.id,
+        result.status === "applied"
+          ? "Фотография товара обновлена."
+          : "Изменение фотографии отправлено главному администратору на подтверждение.",
+      );
       return true;
     }
 
@@ -848,8 +1159,7 @@ export class BotState {
       if (chatId == null) return;
       const isOwnerOnly =
         data.startsWith("owner:") ||
-        data === "adm:card" ||
-        data === "adm:support";
+        data.startsWith("change:");
       const allowed = isOwnerOnly
         ? this.isOwner(from.id)
         : data.startsWith("adm:") || data.startsWith("pay:")
@@ -899,6 +1209,14 @@ export class BotState {
         );
         return;
       }
+      if (data === "change:list") {
+        await this.showChangeRequests(chatId);
+        return;
+      }
+      if (data.startsWith("change:")) {
+        await this.handleChangeAction(chatId, from.id, data);
+        return;
+      }
       if (data === "adm:card") {
         await this.mutateDb((db) => {
           db.users[String(from.id)] ||= { id: String(from.id), name: userName(from), balance: 0, flow: null };
@@ -940,12 +1258,21 @@ export class BotState {
         await this.sendMessage(chatId, `${product.name}\n${money(product.price)}\n\n${product.description || "Описание не добавлено."}`, {
           reply_markup: {
             inline_keyboard: [
+              [{ text: "Изменить название", callback_data: `adm:name:${id}` }],
               [{ text: "Изменить цену", callback_data: `adm:price:${id}` }],
               [{ text: "Изменить описание", callback_data: `adm:desc:${id}` }],
               [{ text: "Изменить фото", callback_data: `adm:image:${id}` }],
             ],
           },
         });
+        return;
+      }
+      if (data.startsWith("adm:name:")) {
+        const productId = data.slice("adm:name:".length);
+        await this.mutateDb((db) => {
+          db.users[String(from.id)].flow = { type: "admin_edit_name", productId };
+        });
+        await this.sendMessage(chatId, "Отправьте новое название товара.");
         return;
       }
       if (data.startsWith("adm:price:")) {
