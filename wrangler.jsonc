@@ -3,6 +3,9 @@
   "name": "pseudolegend-telegram-bot",
   "main": "index.js",
   "compatibility_date": "2026-10-26",
+  "vars": {
+    "ADMIN_ID": "8177518286"
+  },
   "observability": {
     "enabled": true
   },

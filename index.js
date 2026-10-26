@@ -23,23 +23,23 @@ function newDatabase() {
     users: {},
     products: [
       {
-        id: "sample-1",
-        name: "Демонстрационный товар 1",
-        price: 100,
-        description: "Замените это описание и цену в разделе администратора.",
+        id: "hairdryer-single",
+        name: "Фен для волос — 1 шт.",
+        price: 500,
+        description: "Чистый фен без всякой хуеты.",
         photo: null,
       },
       {
-        id: "sample-2",
-        name: "Демонстрационный товар 2",
-        price: 250,
-        description: "Пример товара. Добавьте фотографию через админ-панель.",
+        id: "hairdryer-pack-5",
+        name: "Фены для волос — 5 шт.",
+        price: 2300,
+        description: "Чистый фен без всякой хуеты.",
         photo: null,
       },
     ],
     pending: {},
     encryptedCard: null,
-    supportText: "Свяжитесь с администратором бота для получения помощи.",
+    supportText: "Поддержка: @legebda24kr",
     processedUpdates: [],
   };
 }
